@@ -702,7 +702,7 @@ select option{background:var(--panel);color:var(--text)}
           Run edit
         </button>
         <button type="button" class="btn-cancel" id="btn-cancel" hidden>Cancel</button>
-        <p class="run-hint">The model downloads on the first run, then edits are fast.</p>
+        <p class="run-hint">First run loads ~40&nbsp;GB of weights and can take a few minutes. Later edits are fast.</p>
       </div>
     </div>
 
@@ -1321,7 +1321,7 @@ railAbout.addEventListener("click", () => {
     "FLUX.3 Image Klein — Distilled, 16-step inference.\n\n" +
     "• Edit images with a prompt, or generate from text alone.\n" +
     "• Attach LoRA adapters or load a custom LoRA repo.\n" +
-    "• The model downloads on the first run and stays warm afterwards.\n\n" +
+    "• The ~40 GB of weights load on the first run and stay warm afterwards.\n\n" +
     "Source: github.com/tabrezahmed51/flux-3-image-klein-loras-fast");
 });
 
@@ -1366,6 +1366,14 @@ async function runEdit() {
   showLoader(true, "Queued…");
   seedChip.hidden = true;
 
+  // The first run loads ~40 GB of weights; keep the message honest as it waits.
+  let loaderStage = 0;
+  const loaderTick = window.setInterval(() => {
+    loaderStage += 1;
+    if (loaderStage === 1) loaderText.textContent = "Loading the model — first run only, this can take a few minutes…";
+    else if (loaderStage === 2) loaderText.textContent = "Still loading — large model on first run. It stays warm afterwards.";
+  }, 20000);
+
   try {
     const seed = Number.parseInt(seedInput.value || "-1", 10);
     const randomize = !Number.isFinite(seed) || seed < 0;
@@ -1386,11 +1394,11 @@ async function runEdit() {
     ];
 
     setStatus("Generating…", "busy");
-    showLoader(true, "Generating… the first run also downloads the model.");
+    showLoader(true, "Generating…");
 
     const result = await runApi("edit_image", payload, {
       signal: abortCtrl.signal,
-      onProgress: () => { loaderText.textContent = "Generating…"; }
+      onProgress: () => { if (loaderStage === 0) loaderText.textContent = "Generating…"; }
     });
 
     if (!result || !result.image) {
@@ -1407,6 +1415,7 @@ async function runEdit() {
       openModal("Generation failed", err && err.message ? err.message : String(err));
     }
   } finally {
+    window.clearInterval(loaderTick);
     isGenerating = false;
     currentEventId = null;
     abortCtrl = null;
@@ -1615,8 +1624,14 @@ async function boot() {
     const res = await fetch("/api/status");
     if (res.ok) {
       const st = await res.json();
-      if (st && st.loaded) setStatus("Model loaded", "ok");
-      else setStatus("Ready — model loads on first run", "ok");
+      if (st && st.error) {
+        setStatus("Model unavailable", "off");
+        statusText.title = String(st.error);
+      } else if (st && st.loaded) {
+        setStatus("Model loaded", "ok");
+      } else {
+        setStatus("Ready — model loads on first run", "ok");
+      }
     }
   } catch (_) { /* status is optional */ }
 }

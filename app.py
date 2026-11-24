@@ -3,6 +3,7 @@ import gc
 import json
 import random
 import base64
+import threading
 from io import BytesIO
 
 import numpy as np
@@ -160,56 +161,81 @@ EXAMPLES_CONFIG = [
 ]
 
 # ── Lazy model loading ───────────────────────────────────────────────────────
-# The base model and Pup are loaded on first inference (not at import time) so
-# the Space starts up and serves /api/config and / even if the gated model
-# (black-forest-labs/flux-3-image-klein) cannot be downloaded yet.
-# The model is gated ("auto") — the Space owner must accept the license on the
-# HF model page before downloads succeed. See README for details.
+# The base pipeline and the Pup upsampler are loaded independently and on first
+# use, so a slow/failing Pup can never block normal image editing.
 pipe = None
 pup_processor = None
 upsampler = None
 pup_system_prompts = None
 MODEL_LOAD_ERROR = None
+PUP_LOAD_ERROR = None
+
+_load_lock = threading.Lock()
 
 
-def ensure_loaded():
-    """Load the base model and Pup upsampler on first use.
+def ensure_base_loaded():
+    """Load the FLUX.3 base pipeline on first use. Raises if it cannot load."""
+    global pipe, MODEL_LOAD_ERROR
 
-    Sets MODEL_LOAD_ERROR if loading fails (e.g. gated model not accepted).
-    Safe to call multiple times — subsequent calls are no-ops.
-    """
-    global pipe, pup_processor, upsampler, pup_system_prompts, MODEL_LOAD_ERROR
-
-    if pipe is not None and upsampler is not None:
-        return  # already loaded
-
+    if pipe is not None:
+        return
     if MODEL_LOAD_ERROR is not None:
         raise Exception(MODEL_LOAD_ERROR)
 
-    try:
-        print("Loading FLUX.3 Image Klein (ModularPipeline)…")
-        pipe = ModularPipeline.from_pretrained("black-forest-labs/flux-3-image-klein")
-        pipe.load_components(dtype=torch.bfloat16)
-        pipe.to(device)
-        print("Base model loaded successfully.")
+    with _load_lock:
+        if pipe is not None:
+            return
+        try:
+            print("Loading FLUX.3 Image Klein (ModularPipeline)…")
+            pipe = ModularPipeline.from_pretrained("black-forest-labs/flux-3-image-klein")
+            pipe.load_components(dtype=torch.bfloat16)
+            pipe.to(device)
+            print("Base model loaded successfully.")
+        except Exception as e:
+            MODEL_LOAD_ERROR = str(e)
+            print(f"Base model load failed: {e}")
+            raise
 
-        print("Loading Pup (Qwen3.5 prompt upsampler)…")
-        PUP_ID = "black-forest-labs/flux-3-image-klein-pup"
-        pup_processor = AutoProcessor.from_pretrained(PUP_ID)
-        upsampler = Qwen3_5ForConditionalGeneration.from_pretrained(
-            PUP_ID, dtype=torch.bfloat16, device_map="auto"
-        ).eval()
-        pup_system_prompts = json.load(open(hf_hub_download(PUP_ID, "system_prompts.json")))
-        print("Pup loaded successfully.")
-    except Exception as e:
-        MODEL_LOAD_ERROR = str(e)
-        print(f"Model load failed: {e}")
-        raise
+
+def ensure_pup_loaded():
+    """Load the Qwen3.5 prompt upsampler. Only needed when ``upsample=True``.
+
+    Kept separate from the base model so that a slow or unavailable upsampler
+    cannot block ordinary editing (it previously hung the first inference).
+    """
+    global pup_processor, upsampler, pup_system_prompts, PUP_LOAD_ERROR
+
+    if upsampler is not None:
+        return
+    if PUP_LOAD_ERROR is not None:
+        raise Exception(PUP_LOAD_ERROR)
+
+    with _load_lock:
+        if upsampler is not None:
+            return
+        try:
+            print("Loading Pup (Qwen3.5 prompt upsampler)…")
+            PUP_ID = "black-forest-labs/flux-3-image-klein-pup"
+            pup_processor = AutoProcessor.from_pretrained(PUP_ID)
+            upsampler = Qwen3_5ForConditionalGeneration.from_pretrained(
+                PUP_ID, dtype=torch.bfloat16, device_map="auto"
+            ).eval()
+            pup_system_prompts = json.load(open(hf_hub_download(PUP_ID, "system_prompts.json")))
+            print("Pup loaded successfully.")
+        except Exception as e:
+            PUP_LOAD_ERROR = str(e)
+            print(f"Pup load failed: {e}")
+            raise
+
+
+def ensure_loaded():
+    """Back-compat shim — loads the base pipeline only."""
+    ensure_base_loaded()
 
 
 def upsample_prompt(prompt: str, images=()) -> str:
     """Run the Qwen3.5 Pup upsampler on the user's prompt (with optional references)."""
-    ensure_loaded()
+    ensure_pup_loaded()
     if images:
         text = (
             "Reference images follow in order (the first image, the second image, ...).\n"
@@ -414,9 +440,9 @@ def infer(
          "caption": <prompt used by the model>, "width": int, "height": int,
          "lora": <adapter actually used>}
     """
-    # Load the model on first inference (lazy). This also surfaces a clear
-    # error if the gated model hasn't been accepted by the Space owner.
-    ensure_loaded()
+    # Load the base model on first inference (lazy). The Pup upsampler is only
+    # loaded if upsample=True, so it can never block a normal edit.
+    ensure_base_loaded()
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -588,10 +614,12 @@ def client_config():
 
 @app.get("/api/status")
 def model_status():
-    """Status endpoint: whether the base model is loaded / loadable."""
+    """Status endpoint: whether the base model / upsampler are loaded or loadable."""
     return {
         "loaded": pipe is not None,
+        "pup_loaded": upsampler is not None,
         "error": MODEL_LOAD_ERROR,
+        "pup_error": PUP_LOAD_ERROR,
         "device": str(device),
     }
 
